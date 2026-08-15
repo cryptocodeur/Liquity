@@ -1,0 +1,19 @@
+{
+  "name": "majestic-booking-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Surveille un créneau de réservation d'escape game et déclenche la première étape de réservation dès qu'il se libère.",
+  "bin": {
+    "watch-slot": "./watch-slot.mjs"
+  },
+  "scripts": {
+    "start": "node watch-slot.mjs",
+    "inspect": "node watch-slot.mjs --inspect",
+    "once": "node watch-slot.mjs --once",
+    "postinstall-browsers": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
