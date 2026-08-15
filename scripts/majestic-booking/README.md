@@ -68,7 +68,8 @@ se libère, que l'heure du créneau soit passée, ou que tu fasses `Ctrl+C`.
 | `--no-first-step`     | off                           | N'effectue jamais l'étape 1, se contente d'alerter           |
 | `--headless`          | off                           | Navigateur invisible (déconseillé : tu veux reprendre la main) |
 | `--max-checks <n>`    | illimité                      | Arrêt après n vérifications                                  |
-| `--webhook <url>`     | —                             | POST JSON `{text,title,body}` à chaque alerte (ntfy, Slack…) |
+| `--webhook <url>`     | —                             | Notification HTTP à chaque alerte (ntfy, Slack, Discord…)    |
+| `--webhook-format`    | auto                          | `ntfy` (texte + en-têtes) ou `json` ; auto-détecté sur l'URL  |
 | `--out-dir <chemin>`  | `./out`                       | Captures, logs et dumps                                      |
 | `--inspect`           | off                           | Mode diagnostic (voir plus bas)                              |
 | `--time-regex <re>`   | auto                          | Regex du libellé horaire, si l'auto-détection se trompe      |
@@ -79,7 +80,8 @@ se libère, que l'heure du créneau soit passée, ou que tu fasses `Ctrl+C`.
 | `--no-stop-after-start` | off                         | Continue de vérifier même après l'heure du créneau           |
 
 Les principales options ont aussi un équivalent en variable d'environnement :
-`MEG_URL`, `MEG_DATE`, `MEG_TIME`, `MEG_INTERVAL`, `MEG_WEBHOOK`, `MEG_SLOT_SELECTOR`.
+`MEG_URL`, `MEG_DATE`, `MEG_TIME`, `MEG_INTERVAL`, `MEG_WEBHOOK`, `MEG_WEBHOOK_FORMAT`,
+`MEG_SLOT_SELECTOR`, `MEG_CHROMIUM`.
 
 ## Si le créneau n'est pas détecté
 
@@ -112,6 +114,61 @@ Si le site demande de choisir un nombre de joueurs avant d'afficher les créneau
 ```bash
 node watch-slot.mjs --pre-click "4 joueurs,Continuer"
 ```
+
+## Codes de sortie (mode `--once`)
+
+| Code | Sens                                                              |
+| ---- | ----------------------------------------------------------------- |
+| `0`  | créneau libre (et étape 1 jouée si elle était demandée)            |
+| `1`  | erreur de configuration / Playwright absent                        |
+| `2`  | créneau trouvé mais complet                                        |
+| `3`  | créneau introuvable ou plantage — **la détection est à revoir**    |
+| `4`  | l'heure du créneau est passée, plus rien à surveiller              |
+
+Le `3` est volontairement distinct du `2` : sinon un widget qui change de structure
+ressemblerait éternellement à « complet » et tu raterais le créneau sans le savoir.
+
+## Depuis un téléphone
+
+Le script a besoin de Node + Chromium : il ne tourne pas sur iOS ni sérieusement sous
+Android. Le téléphone sert à **recevoir l'alerte**, pas à faire tourner la surveillance.
+
+### Option A — ntfy (n'importe quelle machine qui reste allumée)
+
+Installe l'app [ntfy](https://ntfy.sh), abonne-toi à un topic au nom imprévisible
+(les topics sont publics), puis :
+
+```bash
+node watch-slot.mjs --no-first-step --webhook https://ntfy.sh/<ton-topic>
+```
+
+Les URL `ntfy.sh` / `ntfy.io` sont détectées automatiquement (envoi en texte brut, avec
+titre, priorité haute et notification cliquable). Pour un ntfy auto-hébergé, force le
+format avec `--webhook-format ntfy` ; pour Slack, Discord ou n8n, laisse le format `json`.
+
+### Option B — GitHub Actions, zéro machine
+
+Le workflow [`.github/workflows/watch-slot.yml`](../../.github/workflows/watch-slot.yml)
+lance une vérification toutes les 10 minutes et, dès que le créneau se libère, **ouvre une
+issue assignée au propriétaire du dépôt** → l'app GitHub mobile envoie une notification
+push. Tu ouvres le lien, tu réserves depuis le téléphone, tu fermes l'issue (tant qu'elle
+est ouverte, aucune alerte en double n'est créée).
+
+À savoir :
+
+- **Un workflow planifié ne tourne que depuis la branche par défaut** : il faut merger ce
+  fichier sur `main` pour que le cron démarre.
+- Le cron est en UTC (`*/10 6-17 15 8 *` = toutes les 10 min de 08h à 19h50 heure de Paris,
+  le 15 août) et GitHub peut le décaler de 5 à 15 minutes en période de charge.
+- Optionnel : ajoute un secret de dépôt `MEG_WEBHOOK` pour recevoir *aussi* la notif ntfy.
+- Le job tourne toujours avec `--no-first-step`. Une CI qui ouvre un tunnel de réservation
+  que personne ne finalise ne sert à rien et bloquerait le créneau pour les autres.
+- Si le code `3` remonte, le job échoue exprès (GitHub t'envoie un mail) : c'est le signal
+  que le widget a changé ou que le site filtre les IP GitHub. L'artefact du run contient les
+  journaux, et `--inspect` en local permet de recaler les sélecteurs.
+
+Tu peux aussi déclencher le workflow à la main depuis l'onglet Actions (`workflow_dispatch`),
+y compris depuis le navigateur du téléphone.
 
 ## Lancer en tâche de fond
 

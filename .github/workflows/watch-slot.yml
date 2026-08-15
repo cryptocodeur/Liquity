@@ -1,0 +1,122 @@
+name: Surveillance créneau escape game
+
+# Vérifie toutes les 10 minutes si le créneau visé s'est libéré et, le cas
+# échéant, ouvre une issue assignée au propriétaire du dépôt (l'app GitHub
+# mobile envoie alors une notification push) + envoie le webhook ntfy/Slack
+# si le secret MEG_WEBHOOK est renseigné.
+#
+# Le job ne fait JAMAIS l'étape 1 de la réservation : une CI qui ouvre un
+# tunnel de réservation que personne ne finalise ne sert à rien et bloquerait
+# le créneau pour les autres clients. Il alerte, tu réserves.
+#
+# Rappel : un workflow planifié ne tourne que depuis la branche par défaut.
+# Les crons GitHub sont exprimés en UTC et peuvent être décalés de plusieurs
+# minutes en période de charge.
+
+on:
+  schedule:
+    # Toutes les 10 min entre 06:00 et 17:59 UTC le 15 août (08h → 19h50 à Paris)
+    - cron: "*/10 6-17 15 8 *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: watch-slot
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TZ: Europe/Paris
+      MEG_URL: https://majestic-escapegame.paris/atlantide/
+      MEG_DATE: "2026-08-15"
+      MEG_TIME: "20:00"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache du navigateur Playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('scripts/majestic-booking/package.json') }}
+
+      - name: Installation
+        working-directory: scripts/majestic-booking
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Vérification du créneau
+        id: check
+        shell: bash
+        working-directory: scripts/majestic-booking
+        env:
+          MEG_WEBHOOK: ${{ secrets.MEG_WEBHOOK }}
+        run: |
+          set +e
+          node watch-slot.mjs --once --headless --no-first-step
+          code=$?
+          set -e
+          case "$code" in
+            0) statut=libre ;;
+            2) statut=complet ;;
+            4) statut=passe ;;
+            *) statut=erreur ;;
+          esac
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "statut=$statut" >> "$GITHUB_OUTPUT"
+          echo "$MEG_DATE $MEG_TIME -> $statut (code $code)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Alerte — issue assignée (notification push GitHub mobile)
+        if: steps.check.outputs.statut == 'libre'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create creneau-libre --color FBCA04 --description "Alerte de créneau disponible" 2>/dev/null || true
+          deja=$(gh issue list --state open --label creneau-libre --json number --jq 'length')
+          if [ "$deja" != "0" ]; then
+            echo "Une alerte est déjà ouverte, on n'en crée pas une seconde."
+            exit 0
+          fi
+          cat > /tmp/alerte.md <<EOF
+          Le créneau **$MEG_TIME du $MEG_DATE** est détecté comme disponible.
+
+          👉 $MEG_URL
+
+          Réserve depuis ton téléphone, puis ferme cette issue : tant qu'elle reste ouverte, aucune nouvelle alerte ne sera créée.
+
+          Détecté par le [run GitHub Actions]($RUN_URL).
+          EOF
+          gh issue create \
+            --title "Créneau libre : $MEG_DATE $MEG_TIME" \
+            --label creneau-libre \
+            --assignee "${{ github.repository_owner }}" \
+            --body-file /tmp/alerte.md
+
+      - name: Journaux et captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-slot-${{ github.run_id }}
+          path: scripts/majestic-booking/out/
+          if-no-files-found: ignore
+          retention-days: 5
+
+      - name: Échec explicite si la détection est cassée
+        if: steps.check.outputs.statut == 'erreur'
+        run: |
+          echo "::error::Créneau introuvable (code ${{ steps.check.outputs.code }}) : le widget a changé ou le site bloque les IP GitHub. Récupère l'artefact du run puis relance 'node watch-slot.mjs --inspect' en local."
+          exit 1

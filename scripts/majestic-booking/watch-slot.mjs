@@ -86,6 +86,8 @@ const CFG = {
   timeoutMs: Number(args.timeout ?? 45000),
   outDir: args.outDir ?? path.join(__dirname, "out"),
   webhook: args.webhook ?? process.env.MEG_WEBHOOK ?? null,
+  // "ntfy" (texte brut + en-têtes) ou "json" ; auto-détecté sur l'URL par défaut
+  webhookFormat: args.webhookFormat ?? process.env.MEG_WEBHOOK_FORMAT ?? null,
   // Échappatoires si l'auto-détection ne suffit pas (voir --inspect) :
   slotSelector: args.slotSelector ?? process.env.MEG_SLOT_SELECTOR ?? null,
   timeRegex: args.timeRegex ?? null,
@@ -93,6 +95,15 @@ const CFG = {
   nextLabel: args.nextLabel ?? null, // ex: "Réserver" — bouton cliqué après le créneau
   stopAfterStart: bool(args.stopAfterStart, true),
   browserPath: args.browserPath ?? process.env.MEG_CHROMIUM ?? null,
+};
+
+/** Codes de sortie — pensés pour être exploitables depuis cron / CI. */
+const EXIT = {
+  AVAILABLE: 0, // créneau libre (et étape 1 jouée si demandée)
+  ERROR: 1, // erreur de configuration / lancement
+  TAKEN: 2, // créneau détecté mais complet
+  BROKEN: 3, // créneau introuvable ou plantage : la détection est à revoir
+  PAST: 4, // l'heure du créneau est passée, plus rien à surveiller
 };
 
 const MONTHS_FR = [
@@ -113,12 +124,12 @@ const MONTHS_FR = [
 const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(CFG.date);
 if (!dateMatch) {
   console.error(`Date invalide : "${CFG.date}" (format attendu : AAAA-MM-JJ)`);
-  process.exit(1);
+  process.exit(EXIT.ERROR);
 }
 const timeMatch = /^(\d{1,2})[:h.]?(\d{2})?$/.exec(CFG.time);
 if (!timeMatch) {
   console.error(`Heure invalide : "${CFG.time}" (format attendu : HH:MM)`);
-  process.exit(1);
+  process.exit(EXIT.ERROR);
 }
 
 const TARGET = {
@@ -175,12 +186,25 @@ async function notify(title, body) {
     }
   }
   if (CFG.webhook) {
-    try {
-      await fetch(CFG.webhook, {
+    // ntfy attend du texte brut + des en-têtes ; Slack/Discord/n8n attendent du JSON.
+    const isNtfy = CFG.webhookFormat
+      ? CFG.webhookFormat === "ntfy"
+      : /(^|\/\/|\.)ntfy\.(sh|io)\//.test(CFG.webhook);
+    const init = isNtfy
+      ? {
+        method: "POST",
+        // Les en-têtes HTTP doivent rester en ASCII : on retire les accents du titre.
+        headers: { Title: norm(title).toUpperCase(), Priority: "urgent", Tags: "tada", Click: CFG.url },
+        body, // l'URL est déjà portée par l'en-tête Click (notification cliquable)
+      }
+      : {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: `${title} — ${body}`, title, body }),
-      });
+        body: JSON.stringify({ text: `${title} — ${body}`, content: `${title} — ${body}`, title, body }),
+      };
+    try {
+      const res = await fetch(CFG.webhook, init);
+      if (!res.ok) log(`Webhook : réponse ${res.status}`);
     } catch (e) {
       log(`Webhook KO : ${e.message}`);
     }
@@ -595,7 +619,8 @@ async function main() {
     checks++;
     if (CFG.stopAfterStart && new Date() > TARGET.at) {
       log(`Le créneau ${TARGET.label} est passé — arrêt de la surveillance.`);
-      break;
+      await browser.close();
+      process.exit(EXIT.PAST); // distinct de « libre » : indispensable en mode cron
     }
 
     let result;
@@ -615,7 +640,7 @@ async function main() {
             await new Promise(() => {}); // on ne ferme pas, l'utilisateur reprend la main
           }
           await browser.close();
-          process.exit(0);
+          process.exit(EXIT.AVAILABLE);
         } catch (e) {
           log(`Échec du clic sur le créneau : ${e.message} — nouvelle tentative au prochain cycle.`);
         }
@@ -624,7 +649,7 @@ async function main() {
         if (CFG.once) {
           await result.context?.close();
           await browser.close();
-          process.exit(0);
+          process.exit(EXIT.AVAILABLE);
         }
       }
     }
@@ -633,7 +658,13 @@ async function main() {
 
     if (CFG.once) {
       await browser.close();
-      process.exit(result?.status === "available" ? 0 : 2);
+      process.exit(
+        result?.status === "available"
+          ? EXIT.AVAILABLE
+          : result?.status === "taken"
+          ? EXIT.TAKEN
+          : EXIT.BROKEN, // not-found / exception : la détection est à revoir, pas « complet »
+      );
     }
     if (CFG.maxChecks && checks >= CFG.maxChecks) {
       log(`Limite de ${CFG.maxChecks} vérifications atteinte — arrêt.`);
